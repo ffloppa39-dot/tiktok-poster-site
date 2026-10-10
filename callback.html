@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Локальный экран для просмотра кода авторизации TikTok.">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#16352e">
+  <title>Код авторизации — DraftBox</title>
+  <link rel="icon" type="image/png" href="app-icon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="callback-card" aria-labelledby="page-title">
+      <p class="eyebrow">DraftBox · TikTok</p>
+      <h1 id="page-title">Код авторизации</h1>
+      <p>Скопируйте код и вставьте его в терминал.</p>
+
+      <div id="code-area" hidden>
+        <output id="code" class="code-box" aria-label="Код авторизации"></output>
+        <button class="button" id="copy-button" type="button">Скопировать код</button>
+        <p id="copy-message" class="message" role="status" aria-live="polite"></p>
+        <div id="state-area" class="state-wrap" hidden>
+          <strong>State</strong>
+          <span id="state" class="state-value"></span>
+        </div>
+      </div>
+
+      <p id="empty-message" class="empty" hidden>No code found</p>
+      <p id="error-message" class="empty" hidden></p>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get("code");
+      const state = params.get("state");
+      const error = params.get("error_description") || params.get("error");
+
+      const codeArea = document.getElementById("code-area");
+      const codeOutput = document.getElementById("code");
+      const emptyMessage = document.getElementById("empty-message");
+      const errorMessage = document.getElementById("error-message");
+      const stateArea = document.getElementById("state-area");
+      const stateOutput = document.getElementById("state");
+
+      if (error) {
+        errorMessage.textContent = "TikTok вернул ошибку: " + error;
+        errorMessage.hidden = false;
+      } else if (code) {
+        codeOutput.textContent = code;
+        codeArea.hidden = false;
+        if (state) {
+          stateOutput.textContent = state;
+          stateArea.hidden = false;
+        }
+        document.getElementById("copy-button").addEventListener("click", async () => {
+          const message = document.getElementById("copy-message");
+          try {
+            await navigator.clipboard.writeText(code);
+            message.textContent = "Код скопирован.";
+          } catch {
+            message.textContent = "Не удалось скопировать автоматически. Выделите код и скопируйте его вручную.";
+          }
+        });
+      } else {
+        emptyMessage.hidden = false;
+      }
+
+      if (code || state || error) {
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+    })();
+  </script>
+</body>
+</html>

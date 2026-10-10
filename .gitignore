@@ -1,0 +1,6 @@
+.env
+.env.*
+tokens.json
+__pycache__/
+*.py[cod]
+
