@@ -1,44 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { cleanupExpiredMedia } from "../src/index.js";
+import worker from "../src/index.js";
 
 const APP_ORIGIN = "https://drafts.example.test";
 
 class MemoryKV {
   values = new Map();
   async get(key, type) {
-    const value = this.values.get(key);
+    const value = this.values.get(key)?.value;
     if (value == null) return null;
-    return type === "json" ? JSON.parse(value) : value;
+    if (type === "json") return JSON.parse(value);
+    if (type === "arrayBuffer") {
+      if (value instanceof ArrayBuffer) return value.slice(0);
+      if (ArrayBuffer.isView(value)) return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      return new TextEncoder().encode(value).buffer;
+    }
+    return value;
   }
-  async put(key, value) { this.values.set(key, value); }
-}
-
-class MemoryR2 {
-  values = new Map();
   async put(key, value, options = {}) {
-    this.values.set(key, {
-      body: new Response(value).body,
-      bytes: new Uint8Array(value),
-      size: value.byteLength,
-      uploaded: new Date(),
-      options,
-    });
-  }
-  async get(key) {
-    const object = this.values.get(key);
-    if (!object) return null;
-    return { body: new Response(object.bytes).body, size: object.size };
-  }
-  async delete(keys) {
-    for (const key of Array.isArray(keys) ? keys : [keys]) this.values.delete(key);
-  }
-  async list({ prefix = "", limit = 1000 }) {
-    const objects = [...this.values.entries()]
-      .filter(([key]) => key.startsWith(prefix))
-      .slice(0, limit)
-      .map(([key, value]) => ({ key, uploaded: value.uploaded }));
-    return { objects, truncated: false, cursor: undefined };
+    const stored = value instanceof ArrayBuffer
+      ? value.slice(0)
+      : ArrayBuffer.isView(value)
+        ? value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)
+        : value;
+    this.values.set(key, { value: stored, options });
   }
 }
 
@@ -50,7 +35,6 @@ function makeEnv() {
     TIKTOK_CLIENT_SECRET: "client-secret",
     PUBLIC_ORIGIN: "",
     TOKENS: new MemoryKV(),
-    MEDIA: new MemoryR2(),
   };
 }
 
@@ -149,6 +133,8 @@ test("OAuth, photo draft upload, and TikTok media fetch work end to end", async 
     assert.equal(mediaUrl.origin, APP_ORIGIN);
     assert.match(mediaUrl.pathname, /^\/tiktok\/media\/[A-Za-z0-9_-]{43}\.jpg$/u);
 
+    const storedKey = `media/${mediaUrl.pathname.match(/([A-Za-z0-9_-]{43})\.jpg$/u)[1]}.jpg`;
+    assert.equal(env.TOKENS.values.get(storedKey).options.expirationTtl, 2 * 60 * 60);
     const media = await call(env, mediaUrl.pathname);
     assert.equal(media.status, 200);
     assert.equal(media.headers.get("Content-Type"), "image/jpeg");
@@ -224,22 +210,11 @@ test("media route only serves stored files with a random key", async () => {
 test("TikTok URL-prefix verification file is served only at its exact public path", async () => {
   const env = makeEnv();
   const content = new TextEncoder().encode("tiktok-verification-signature");
-  await env.MEDIA.put("verification/tiktok-domain-check.txt", content);
+  await env.TOKENS.put("verification/tiktok-domain-check.txt", content.buffer);
 
   const verified = await call(env, "/tiktok/tiktok-domain-check.txt");
   assert.equal(verified.status, 200);
   assert.equal(verified.headers.get("Content-Type"), "application/octet-stream");
   assert.equal(await verified.text(), "tiktok-verification-signature");
   assert.equal((await call(env, "/tiktok/not-found.txt")).status, 404);
-});
-
-test("hourly cleanup removes media older than two hours and keeps recent files", async () => {
-  const env = makeEnv();
-  const stale = "media/old.jpg";
-  const fresh = "media/new.jpg";
-  env.MEDIA.values.set(stale, { bytes: new Uint8Array([1]), uploaded: new Date(Date.now() - 3 * 60 * 60 * 1000) });
-  env.MEDIA.values.set(fresh, { bytes: new Uint8Array([2]), uploaded: new Date(Date.now() - 30 * 60 * 1000) });
-  assert.equal(await cleanupExpiredMedia(env), 1);
-  assert.equal(env.MEDIA.values.has(stale), false);
-  assert.equal(env.MEDIA.values.has(fresh), true);
 });
