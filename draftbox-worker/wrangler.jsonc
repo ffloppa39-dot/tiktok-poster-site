@@ -7,9 +7,5 @@
   "observability": { "enabled": true },
   "kv_namespaces": [
     { "binding": "TOKENS", "id": "ebbc87251fcd4a50a90e8460eec50ced" }
-  ],
-  "r2_buckets": [
-    { "binding": "MEDIA", "bucket_name": "draftbox-meme-media" }
-  ],
-  "triggers": { "crons": ["0 * * * *"] }
+  ]
 }
