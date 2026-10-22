@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "draftbox-meme-drafts",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-22",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "kv_namespaces": [
+    { "binding": "TOKENS", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }
+  ],
+  "r2_buckets": [
+    { "binding": "MEDIA", "bucket_name": "draftbox-meme-media" }
+  ],
+  "triggers": { "crons": ["0 * * * *"] }
+}
