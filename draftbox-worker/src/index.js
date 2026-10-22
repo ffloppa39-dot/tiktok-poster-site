@@ -1,9 +1,13 @@
 const AUTHORIZE_URL = "https://www.tiktok.com/v2/auth/authorize/";
 const TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/";
 const PHOTO_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/content/init/";
+const PHOTO_STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/";
 const TOKEN_KEY = "tiktok_tokens";
 const COOKIE_NAME = "draftbox_session";
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_AGENT_UPLOADS_PER_HOUR = 10;
+const AGENT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const MCP_MAX_BODY_BYTES = Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 64 * 1024;
 const COOKIE_TTL_SECONDS = 12 * 60 * 60;
 const MEDIA_TTL_SECONDS = 2 * 60 * 60;
 const MEDIA_ID_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -288,7 +292,7 @@ async function accessToken(env, requestUrl) {
   return tokens.access_token;
 }
 
-async function sendPhoto(env, jpeg, requestUrl) {
+async function sendPhoto(env, jpeg, requestUrl, beforeTikTokRequest = null) {
   if (!env.TOKENS) throw new DraftBoxError("Не настроено KV-хранилище TOKENS.");
   const { origin } = originAndCallback(env, requestUrl);
   const token = await accessToken(env, requestUrl);
@@ -309,6 +313,7 @@ async function sendPhoto(env, jpeg, requestUrl) {
     post_mode: "MEDIA_UPLOAD",
     media_type: "PHOTO",
   };
+  if (beforeTikTokRequest) await beforeTikTokRequest();
   let response;
   try {
     response = await fetch(PHOTO_INIT_URL, {
@@ -377,9 +382,443 @@ async function renderHome(env, session, options = {}, status = 200) {
   return htmlResponse(homePage({ csrf: session.csrf, connected, ...options }), status);
 }
 
+
+function jsonResponse(value, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=UTF-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      ...extraHeaders,
+    },
+  });
+}
+
+async function isAgentAuthorized(request, env) {
+  const expected = env.AGENT_UPLOAD_TOKEN;
+  if (typeof expected !== "string" || !/^[A-Za-z0-9_-]{43,}$/u.test(expected)) return false;
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer ([A-Za-z0-9._~-]+)$/u);
+  return Boolean(match && await constantTimeTextEqual(match[1], expected));
+}
+
+async function readLimitedBody(request, maxBytes) {
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new DraftBoxError("Тело запроса превышает допустимый размер.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function jpegDimensions(bytes) {
+  if (!isJpeg(bytes)) return null;
+  let offset = 2;
+  let width = 0;
+  let height = 0;
+  let sawStartOfScan = false;
+  while (offset + 1 < bytes.length) {
+    if (bytes[offset] !== 0xff) return null;
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
+    if (offset >= bytes.length) return null;
+    const marker = bytes[offset++];
+    if (marker === 0xd9) break;
+    if (marker === 0xda) {
+      sawStartOfScan = true;
+      break;
+    }
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 1 >= bytes.length) return null;
+    const segmentLength = (bytes[offset] << 8) | bytes[offset + 1];
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) return null;
+    const isSof = (marker >= 0xc0 && marker <= 0xc3)
+      || (marker >= 0xc5 && marker <= 0xc7)
+      || (marker >= 0xc9 && marker <= 0xcb)
+      || (marker >= 0xcd && marker <= 0xcf);
+    if (isSof) {
+      if (segmentLength < 8) return null;
+      height = (bytes[offset + 3] << 8) | bytes[offset + 4];
+      width = (bytes[offset + 5] << 8) | bytes[offset + 6];
+    }
+    offset += segmentLength;
+  }
+  return sawStartOfScan && width > 0 && height > 0 ? { width, height } : null;
+}
+
+async function sha256Hex(bytes) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+async function guardRequest(env, operation, key, record = null) {
+  if (!env.AGENT_UPLOAD_GUARD) throw new DraftBoxError("Не настроен атомарный шлюз защиты от повторной отправки.");
+  const id = env.AGENT_UPLOAD_GUARD.idFromName("draftbox-agent-upload-v1");
+  const stub = env.AGENT_UPLOAD_GUARD.get(id);
+  const response = await stub.fetch("https://agent-upload-guard.internal/" + operation, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operation, key, record }),
+  });
+  if (!response.ok) throw new DraftBoxError("Не удалось проверить состояние безопасной загрузки.");
+  return response.json();
+}
+
+function publicAgentResult(record) {
+  const state = String(record?.state || "unknown");
+  const messages = {
+    accepted: "TikTok принял запрос; подтверждение доставки в Inbox ещё ожидается.",
+    inbox: "TikTok подтвердил отправку уведомления в Inbox для завершения черновика.",
+    published: "TikTok подтвердил публикацию.",
+    sending: "Запрос отправляется в TikTok; не запускай повторную отправку.",
+    reserved: "Операция зарезервирована; проверь статус перед любым повтором.",
+    unknown: "Ответ TikTok не удалось подтвердить. Проверь Inbox; повторная отправка заблокирована.",
+    preflight_failed: "Мем не был отправлен в TikTok; исправь указанную проблему и повтори запрос.",
+    failed: "TikTok сообщил об ошибке обработки.",
+  };
+  return {
+    state,
+    message: messages[state] || "Статус операции проверяется.",
+    ...(record?.sha256 ? { image_sha256: record.sha256 } : {}),
+    ...(record?.publish_id ? { publish_id: record.publish_id } : {}),
+    ...(record?.tiktok_status ? { tiktok_status: record.tiktok_status } : {}),
+    ...(record?.created_at ? { created_at: record.created_at } : {}),
+  };
+}
+
+async function submitAgentMeme(env, jpeg, requestUrl) {
+  if (!(jpeg instanceof Uint8Array) || jpeg.byteLength <= 0) {
+    return { status: 400, body: { ok: false, error: "Передан пустой JPEG." } };
+  }
+  if (jpeg.byteLength > MAX_IMAGE_BYTES) {
+    return { status: 413, body: { ok: false, error: "JPEG превышает лимит 20 МБ." } };
+  }
+  const dimensions = jpegDimensions(jpeg);
+  if (!dimensions) {
+    return { status: 400, body: { ok: false, error: "Файл не является корректно структурированным JPEG." } };
+  }
+  if (dimensions.width !== 1080 || dimensions.height !== 1920) {
+    return { status: 400, body: { ok: false, error: "Для отправки нужен финальный мем размером ровно 1080×1920 px." } };
+  }
+  let imageHash;
+  try {
+    imageHash = await sha256Hex(jpeg);
+  } catch {
+    return { status: 500, body: { ok: false, error: "Не удалось проверить идентификатор изображения." } };
+  }
+  const now = Date.now();
+  const initialRecord = {
+    sha256: imageHash,
+    state: "reserved",
+    created_at: new Date(now).toISOString(),
+    expires_at: now + AGENT_IDEMPOTENCY_TTL_MS,
+  };
+  let claim;
+  try {
+    claim = await guardRequest(env, "claim", imageHash, initialRecord);
+  } catch (error) {
+    return { status: 503, body: { ok: false, error: error.message } };
+  }
+  if (claim.status === "rate_limited") {
+    return { status: 429, body: { ok: false, error: "Достигнут лимит: не более 10 новых отправок в час." } };
+  }
+  if (!claim.claimed) {
+    const current = claim.record || { sha256: imageHash, state: "unknown" };
+    return { status: 202, body: { ok: true, duplicate_suppressed: true, ...publicAgentResult(current) } };
+  }
+
+  let tiktokRequestStarted = false;
+  try {
+    const publishId = await sendPhoto(env, jpeg, requestUrl, async () => {
+      await guardRequest(env, "update", imageHash, {
+        ...initialRecord,
+        state: "sending",
+        created_at: new Date(now).toISOString(),
+      });
+      tiktokRequestStarted = true;
+    });
+    const acceptedRecord = {
+      ...initialRecord,
+      state: "accepted",
+      publish_id: publishId,
+    };
+    await guardRequest(env, "update", imageHash, acceptedRecord);
+    return { status: 202, body: { ok: true, duplicate_suppressed: false, ...publicAgentResult(acceptedRecord) } };
+  } catch (error) {
+    const failureRecord = {
+      ...initialRecord,
+      state: tiktokRequestStarted ? "unknown" : "preflight_failed",
+      error_code: tiktokRequestStarted ? "tiktok_result_uncertain" : "preflight_failed",
+    };
+    try { await guardRequest(env, "update", imageHash, failureRecord); } catch { /* Keep the original operation safely reserved. */ }
+    if (tiktokRequestStarted) {
+      return {
+        status: 502,
+        body: {
+          ok: false,
+          ...publicAgentResult(failureRecord),
+          error: "Не удалось подтвердить ответ TikTok. Проверь Inbox; запрос автоматически повторяться не будет.",
+        },
+      };
+    }
+    return { status: 503, body: { ok: false, ...publicAgentResult(failureRecord), error: error.message } };
+  }
+}
+
+async function fetchTikTokPhotoStatus(env, publishId, requestUrl) {
+  const token = await accessToken(env, requestUrl);
+  let response;
+  try {
+    response = await fetch(PHOTO_STATUS_URL, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json; charset=UTF-8" },
+      body: JSON.stringify({ publish_id: publishId }),
+    });
+  } catch {
+    throw new DraftBoxError("Не удалось получить статус обработки у TikTok.");
+  }
+  const payload = await parseTikTokResponse(response, "проверке статуса черновика");
+  const status = payload.data?.status;
+  if (typeof status !== "string" || !status) throw new DraftBoxError("TikTok не вернул статус обработки.");
+  return status;
+}
+
+async function getAgentStatus(env, imageHash, requestUrl) {
+  if (!/^[a-f0-9]{64}$/u.test(imageHash)) return { status: 400, body: { ok: false, error: "Некорректный SHA-256 изображения." } };
+  let lookup;
+  try {
+    lookup = await guardRequest(env, "get", imageHash);
+  } catch (error) {
+    return { status: 503, body: { ok: false, error: error.message } };
+  }
+  if (!lookup.record || Number(lookup.record.expires_at || 0) <= Date.now()) return { status: 404, body: { ok: false, error: "Операция не найдена или истёк срок её хранения." } };
+  let record = lookup.record;
+  if (record.state === "accepted" && record.publish_id) {
+    try {
+      const tiktokStatus = await fetchTikTokPhotoStatus(env, record.publish_id, requestUrl);
+      let state = "accepted";
+      if (tiktokStatus === "SEND_TO_USER_INBOX") state = "inbox";
+      else if (tiktokStatus === "PUBLISH_COMPLETE") state = "published";
+      else if (tiktokStatus === "FAILED") state = "failed";
+      record = {
+        ...record,
+        state,
+        tiktok_status: tiktokStatus,
+        status_checked_at: new Date().toISOString(),
+      };
+      await guardRequest(env, "update", imageHash, record);
+    } catch {
+      // A failed status lookup never triggers a second upload or downgrades a known state.
+    }
+  }
+  return { status: 200, body: { ok: true, ...publicAgentResult(record) } };
+}
+
+function decodeBase64Image(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 8
+      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
+    throw new DraftBoxError("Передай JPEG как обычную Base64-строку без data URL.");
+  }
+  let binary;
+  try { binary = atob(value); } catch { throw new DraftBoxError("Не удалось прочитать Base64 JPEG."); }
+  if (binary.length > MAX_IMAGE_BYTES) throw new DraftBoxError("JPEG превышает лимит 20 МБ.");
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function mcpToolResult(id, value, isError = false) {
+  const result = {
+    content: [{ type: "text", text: JSON.stringify(value) }],
+    isError,
+    structuredContent: value,
+  };
+  return jsonResponse({ jsonrpc: "2.0", id, result }, 200, { "MCP-Protocol-Version": "2025-03-26" });
+}
+
+function mcpTools() {
+  return [
+    {
+      name: "upload_finished_meme_to_inbox",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      description: "Upload one final, selected 1080×1920 JPEG to the already connected TikTok account's Inbox using DraftBox. This only initiates TikTok MEDIA_UPLOAD with video.upload; it never directly publishes. Do not use for options or previews. The same exact JPEG is protected against duplicate uploads for 24 hours.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          image_base64: { type: "string", description: "The exact bytes of the saved final JPEG, encoded as standard Base64 without a data: prefix.", maxLength: Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 8 },
+        },
+        required: ["image_base64"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "check_finished_meme_inbox_status",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      description: "Check an existing DraftBox upload by its returned image_sha256. Reports TikTok accepted, Inbox notification sent, published, failed, or unknown. It never starts another upload.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          image_sha256: { type: "string", pattern: "^[a-f0-9]{64}$", description: "image_sha256 returned by the upload tool." },
+        },
+        required: ["image_sha256"],
+        additionalProperties: false,
+      },
+    },
+  ];
+}
+
+async function handleMcpRequest(request, env) {
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST", "Cache-Control": "no-store" } });
+  if (!await isAgentAuthorized(request, env)) {
+    const status = typeof env.AGENT_UPLOAD_TOKEN === "string" && env.AGENT_UPLOAD_TOKEN.length >= 43 ? 401 : 503;
+    return jsonResponse({ error: status === 401 ? "Unauthorized" : "Agent upload is not configured." }, status, status === 401 ? { "WWW-Authenticate": "Bearer" } : {});
+  }
+  if (!(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) {
+    return jsonResponse({ error: "Content-Type must be application/json." }, 415);
+  }
+  let body;
+  try {
+    const bytes = await readLimitedBody(request, MCP_MAX_BODY_BYTES);
+    body = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (error) {
+    return jsonResponse({ error: error instanceof DraftBoxError ? error.message : "Invalid MCP request." }, error instanceof DraftBoxError ? 413 : 400);
+  }
+  if (!body || body.jsonrpc !== "2.0" || typeof body.method !== "string") {
+    return jsonResponse({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32600, message: "Invalid Request" } }, 400);
+  }
+  if (body.method === "notifications/initialized") return new Response(null, { status: 202, headers: { "Cache-Control": "no-store" } });
+  if (body.method === "ping") return jsonResponse({ jsonrpc: "2.0", id: body.id ?? null, result: {} });
+  if (body.method === "initialize") {
+    const requested = body.params?.protocolVersion;
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: body.id ?? null,
+      result: {
+        protocolVersion: typeof requested === "string" ? requested : "2025-03-26",
+        capabilities: { tools: { listChanged: false } },
+        instructions: "Only send the one saved, selected final meme. Never send variants or previews. This tool initiates TikTok Inbox upload with video.upload and never publishes. After upload, check status; if unknown, do not retry.",
+        serverInfo: { name: "DraftBox TikTok Inbox", version: "1.0.0" },
+      },
+    }, 200, { "MCP-Protocol-Version": typeof requested === "string" ? requested : "2025-03-26" });
+  }
+  if (body.method === "tools/list") return jsonResponse({ jsonrpc: "2.0", id: body.id ?? null, result: { tools: mcpTools() } });
+  if (body.method !== "tools/call") {
+    return jsonResponse({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32601, message: "Method not found" } }, 200);
+  }
+  const name = body.params?.name;
+  const args = body.params?.arguments || {};
+  if (name === "upload_finished_meme_to_inbox") {
+    let jpeg;
+    try { jpeg = decodeBase64Image(args.image_base64); }
+    catch (error) { return mcpToolResult(body.id ?? null, { ok: false, error: error.message }, true); }
+    const submitted = await submitAgentMeme(env, jpeg, request.url);
+    return mcpToolResult(body.id ?? null, submitted.body, submitted.status >= 400);
+  }
+  if (name === "check_finished_meme_inbox_status") {
+    const checked = await getAgentStatus(env, String(args.image_sha256 || ""), request.url);
+    return mcpToolResult(body.id ?? null, checked.body, checked.status >= 400);
+  }
+  return jsonResponse({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32602, message: "Unknown tool or invalid arguments" } }, 200);
+}
+
+export class AgentUploadGuard {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    let input;
+    try { input = await request.json(); } catch { return jsonResponse({ error: "Invalid request" }, 400); }
+    const { operation, key, record } = input || {};
+    if (!/^[a-f0-9]{64}$/u.test(String(key || ""))) return jsonResponse({ error: "Invalid key" }, 400);
+    return this.state.blockConcurrencyWhile(async () => {
+      const storage = this.state.storage;
+      const storageKey = "upload:" + key;
+      const now = Date.now();
+      if (operation === "claim") {
+        const existing = await storage.get(storageKey);
+        if (existing && existing.expires_at > now && existing.state !== "preflight_failed") {
+          return jsonResponse({ status: "existing", claimed: false, record: existing });
+        }
+        const rate = await storage.get("agent_rate_window");
+        if (rate && now < rate.reset_at && rate.count >= MAX_AGENT_UPLOADS_PER_HOUR) {
+          return jsonResponse({ status: "rate_limited" });
+        }
+        if (!rate || now >= rate.reset_at) {
+          await storage.put("agent_rate_window", { count: 1, reset_at: now + 60 * 60 * 1000 });
+        } else {
+          await storage.put("agent_rate_window", { count: rate.count + 1, reset_at: rate.reset_at });
+        }
+        await storage.put(storageKey, record);
+        return jsonResponse({ status: "claimed", claimed: true, record });
+      }
+      if (operation === "get") {
+        const existing = await storage.get(storageKey);
+        return jsonResponse({ record: existing || null });
+      }
+      if (operation === "update") {
+        const existing = await storage.get(storageKey);
+        if (!existing) return jsonResponse({ error: "Operation not found" }, 404);
+        const updated = { ...existing, ...record, sha256: key };
+        await storage.put(storageKey, updated);
+        return jsonResponse({ record: updated });
+      }
+      return jsonResponse({ error: "Unsupported operation" }, 400);
+    });
+  }
+}
+
+async function handleAgentRequest(request, env, url) {
+  if (!await isAgentAuthorized(request, env)) {
+    const status = typeof env.AGENT_UPLOAD_TOKEN === "string" && env.AGENT_UPLOAD_TOKEN.length >= 43 ? 401 : 503;
+    return jsonResponse({ ok: false, error: status === 401 ? "Unauthorized" : "Agent upload is not configured." }, status, status === 401 ? { "WWW-Authenticate": "Bearer" } : {});
+  }
+  if (url.pathname === "/agent/upload/") {
+    if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST", "Cache-Control": "no-store" } });
+    if ((request.headers.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase() !== "image/jpeg") {
+      return jsonResponse({ ok: false, error: "Content-Type must be image/jpeg." }, 415);
+    }
+    const declaredLength = request.headers.get("Content-Length");
+    if (declaredLength && (!/^\d+$/u.test(declaredLength) || Number(declaredLength) > MAX_IMAGE_BYTES)) {
+      return jsonResponse({ ok: false, error: "JPEG exceeds the 20 MB limit." }, 413);
+    }
+    let jpeg;
+    try { jpeg = await readLimitedBody(request, MAX_IMAGE_BYTES); }
+    catch (error) { return jsonResponse({ ok: false, error: error.message }, 413); }
+    const result = await submitAgentMeme(env, jpeg, request.url);
+    return jsonResponse(result.body, result.status);
+  }
+  const match = url.pathname.match(/^\/agent\/status\/([a-f0-9]{64})$/u);
+  if (match && request.method === "GET") {
+    const result = await getAgentStatus(env, match[1], request.url);
+    return jsonResponse(result.body, result.status);
+  }
+  return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+}
+
+
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   if (url.pathname === "/healthz" && request.method === "GET") return new Response("ok", { headers: { "Cache-Control": "no-store" } });
+  if (url.pathname === "/mcp") return handleMcpRequest(request, env);
+  if (url.pathname === "/agent/upload/" || url.pathname.startsWith("/agent/status/")) return handleAgentRequest(request, env, url);
   if (url.pathname.startsWith("/tiktok/media/")) return request.method === "GET" ? mediaResponse(env, url.pathname) : new Response("Method not allowed", { status: 405 });
   const verificationFile = request.method === "GET" ? await verificationFileResponse(env, url.pathname) : null;
   if (verificationFile) return verificationFile;

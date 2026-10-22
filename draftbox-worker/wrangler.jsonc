@@ -7,5 +7,13 @@
   "observability": { "enabled": true },
   "kv_namespaces": [
     { "binding": "TOKENS", "id": "ebbc87251fcd4a50a90e8460eec50ced" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "AGENT_UPLOAD_GUARD", "class_name": "AgentUploadGuard" }
+    ]
+  },
+  "migrations": [
+    { "tag": "agent-upload-guard-v1", "new_classes": ["AgentUploadGuard"] }
   ]
 }
