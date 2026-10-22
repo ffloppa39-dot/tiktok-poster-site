@@ -5,7 +5,7 @@ const TOKEN_KEY = "tiktok_tokens";
 const COOKIE_NAME = "draftbox_session";
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const COOKIE_TTL_SECONDS = 12 * 60 * 60;
-const MEDIA_TTL_MS = 2 * 60 * 60 * 1000;
+const MEDIA_TTL_SECONDS = 2 * 60 * 60;
 const MEDIA_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 const PUBLISH_ID_RE = /^[A-Za-z0-9._~-]{1,64}$/;
 const encoder = new TextEncoder();
@@ -289,18 +289,15 @@ async function accessToken(env, requestUrl) {
 }
 
 async function sendPhoto(env, jpeg, requestUrl) {
-  if (!env.MEDIA) throw new DraftBoxError("Не настроено R2-хранилище MEDIA.");
+  if (!env.TOKENS) throw new DraftBoxError("Не настроено KV-хранилище TOKENS.");
   const { origin } = originAndCallback(env, requestUrl);
   const token = await accessToken(env, requestUrl);
   const mediaId = randomToken();
   const key = `media/${mediaId}.jpg`;
   try {
-    await env.MEDIA.put(key, jpeg, {
-      httpMetadata: { contentType: "image/jpeg", cacheControl: "no-store" },
-      customMetadata: { createdAt: String(Date.now()) },
-    });
+    await env.TOKENS.put(key, jpeg.buffer, { expirationTtl: MEDIA_TTL_SECONDS });
   } catch {
-    throw new DraftBoxError("Не удалось сохранить временный JPEG в R2.");
+    throw new DraftBoxError("Не удалось сохранить временный JPEG в KV.");
   }
   const body = {
     post_info: {},
@@ -333,13 +330,13 @@ async function sendPhoto(env, jpeg, requestUrl) {
 async function mediaResponse(env, pathname) {
   const match = pathname.match(/^\/tiktok\/media\/([A-Za-z0-9_-]{43})\.jpg$/u);
   if (!match || !MEDIA_ID_RE.test(match[1])) return new Response("Not found", { status: 404 });
-  if (!env.MEDIA) return new Response("Not found", { status: 404 });
-  const object = await env.MEDIA.get(`media/${match[1]}.jpg`);
-  if (!object) return new Response("Not found", { status: 404 });
-  return new Response(object.body, {
+  if (!env.TOKENS) return new Response("Not found", { status: 404 });
+  const bytes = await env.TOKENS.get(`media/${match[1]}.jpg`, "arrayBuffer");
+  if (!bytes) return new Response("Not found", { status: 404 });
+  return new Response(bytes, {
     headers: {
       "Content-Type": "image/jpeg",
-      "Content-Length": String(object.size),
+      "Content-Length": String(bytes.byteLength),
       "Cache-Control": "no-store, max-age=0",
       "X-Content-Type-Options": "nosniff",
     },
@@ -348,10 +345,10 @@ async function mediaResponse(env, pathname) {
 
 async function verificationFileResponse(env, pathname) {
   const match = pathname.match(/^\/tiktok\/([A-Za-z0-9._-]{1,200})$/u);
-  if (!match || !env.MEDIA) return null;
-  const object = await env.MEDIA.get(`verification/${match[1]}`);
-  if (!object) return null;
-  return new Response(object.body, {
+  if (!match || !env.TOKENS) return null;
+  const bytes = await env.TOKENS.get(`verification/${match[1]}`, "arrayBuffer");
+  if (!bytes) return null;
+  return new Response(bytes, {
     headers: {
       "Content-Type": "application/octet-stream",
       "Cache-Control": "no-store",
@@ -505,25 +502,6 @@ async function constantTimeTextEqual(left, right) {
   return mismatch === 0 && left.length === right.length;
 }
 
-export async function cleanupExpiredMedia(env, now = Date.now()) {
-  if (!env.MEDIA) return 0;
-  let cursor;
-  let removed = 0;
-  do {
-    const page = await env.MEDIA.list({ prefix: "media/", limit: 1000, ...(cursor ? { cursor } : {}) });
-    const stale = page.objects
-      .filter((object) => now - new Date(object.uploaded).getTime() > MEDIA_TTL_MS)
-      .map((object) => object.key);
-    for (let offset = 0; offset < stale.length; offset += 1000) {
-      const batch = stale.slice(offset, offset + 1000);
-      if (batch.length) await env.MEDIA.delete(batch);
-      removed += batch.length;
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  return removed;
-}
-
 export default {
   async fetch(request, env) {
     try {
@@ -539,8 +517,5 @@ export default {
         headers: { "Content-Type": "text/plain; charset=UTF-8", "Cache-Control": "no-store" },
       });
     }
-  },
-  async scheduled(_controller, env) {
-    await cleanupExpiredMedia(env);
   },
 };
