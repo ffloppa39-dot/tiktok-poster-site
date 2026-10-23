@@ -45,7 +45,7 @@ This adds a remote MCP endpoint and a separate raw HTTP endpoint. It reuses the 
 
 1. Generate a random value at least 43 characters long using only A-Z, a-z, 0-9, underscore, and hyphen in a password manager. Do not send it in chat, put it in GitHub or project files, or type it into a terminal command.
 2. Merge the feature branch into main (or select it in Workers Builds after review). The connected build uses draftbox-worker, npm ci, and npx wrangler deploy. The Durable Object is created by the wrangler.jsonc migration; the existing TOKENS namespace and OAuth record are unchanged.
-3. In Cloudflare Dashboard open Workers & Pages → draftbox-meme-drafts → Settings → Variables and Secrets → Add → Secret. Name: AGENT_UPLOAD_TOKEN. Paste the random string from step 1. Save as a Production Secret, not a plain Variable.
+3. In Cloudflare Dashboard open Workers & Pages → tiktok-poster-site → Settings → Variables and Secrets → Add → Secret. Name: AGENT_UPLOAD_TOKEN. Paste the random string from step 1. Save as a Production Secret, not a plain Variable.
 4. Wait for a successful production deploy. Do not trigger TikTok OAuth or change the connected account.
 
 ### Connect MCP in Codex desktop, CLI, or IDE
