@@ -8,6 +8,11 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_AGENT_UPLOADS_PER_HOUR = 10;
 const AGENT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 const MCP_MAX_BODY_BYTES = Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 64 * 1024;
+const MCP_PUBLIC_BODY_BYTES = 64 * 1024;
+const OAUTH_CODE_TTL_MS = 5 * 60 * 1000;
+const OAUTH_ACCESS_TTL_MS = 60 * 60 * 1000;
+const OAUTH_REFRESH_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const OAUTH_SCOPES = Object.freeze(["draftbox:upload", "draftbox:status"]);
 const COOKIE_TTL_SECONDS = 12 * 60 * 60;
 const MEDIA_TTL_SECONDS = 2 * 60 * 60;
 const MEDIA_ID_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -125,11 +130,11 @@ function redirectResponse(location, cookie = "") {
   return new Response(null, { status: 302, headers });
 }
 
-function loginPage(csrf, error = "") {
+function loginPage(csrf, error = "", returnTo = "/") {
   return `<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DraftBox</title><body style="font:16px system-ui;max-width:34rem;margin:12vh auto;padding:0 1rem;background:#101114;color:#f4f4f5">
 <h1>DraftBox</h1><p>Вход в загрузчик черновиков.</p>${error ? `<p role="alert" style="color:#ff8a8a">${escapeHtml(error)}</p>` : ""}
-<form method="post" action="/login/"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}">
+<form method="post" action="/login/"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">
 <label>Пароль <input name="password" type="password" autocomplete="current-password" required></label>
 <button type="submit">Войти</button></form></body></html>`;
 }
@@ -403,6 +408,282 @@ async function isAgentAuthorized(request, env) {
   return Boolean(match && await constantTimeTextEqual(match[1], expected));
 }
 
+function tokenHash(value) {
+  return crypto.subtle.digest("SHA-256", encoder.encode(value)).then((digest) =>
+    [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join(""));
+}
+
+async function oauthGuardRequest(env, operation, key, record = {}) {
+  if (!env.AGENT_UPLOAD_GUARD) throw new DraftBoxError("OAuth storage is not configured.");
+  const id = env.AGENT_UPLOAD_GUARD.idFromName("draftbox-agent-upload-v1");
+  const stub = env.AGENT_UPLOAD_GUARD.get(id);
+  const response = await stub.fetch("https://agent-upload-guard.internal/oauth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operation, key, record }),
+  });
+  if (!response.ok) throw new DraftBoxError("OAuth storage request failed.");
+  return response.json();
+}
+
+function allowedOAuthRedirect(value) {
+  try {
+    const uri = new URL(value);
+    const host = uri.hostname.toLowerCase();
+    const openAIHost = host === "chatgpt.com" || host.endsWith(".chatgpt.com")
+      || host === "openai.com" || host.endsWith(".openai.com");
+    return uri.protocol === "https:" && openAIHost && !uri.username && !uri.password
+      && !uri.hash && (!uri.port || uri.port === "443");
+  } catch { return false; }
+}
+
+function oauthJson(value, status = 200, extraHeaders = {}) {
+  return jsonResponse(value, status, { "Cache-Control": "no-store", Pragma: "no-cache", ...extraHeaders });
+}
+
+function oauthAuthorizationMetadata(origin) {
+  return {
+    issuer: origin,
+    authorization_response_iss_parameter_supported: true,
+    authorization_endpoint: `${origin}/oauth/authorize`,
+    token_endpoint: `${origin}/oauth/token`,
+    registration_endpoint: `${origin}/oauth/register`,
+    token_endpoint_auth_methods_supported: ["none"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: OAUTH_SCOPES,
+  };
+}
+
+function oauthResourceMetadata(origin) {
+  return {
+    resource: origin,
+    authorization_servers: [origin],
+    scopes_supported: OAUTH_SCOPES,
+    resource_documentation: `${origin}/`,
+  };
+}
+
+function oauthChallenge(origin, scope, error = "") {
+  const fields = [`resource_metadata="${origin}/.well-known/oauth-protected-resource"`];
+  if (scope) fields.push(`scope="${scope}"`);
+  if (error) fields.push(`error="${error}"`);
+  return `Bearer ${fields.join(", ")}`;
+}
+
+function localReturnTo(value) {
+  if (typeof value !== "string" || !value.startsWith("/oauth/authorize?") || value.startsWith("//")) return "/";
+  try {
+    const parsed = new URL(value, "https://draftbox.invalid");
+    return parsed.origin === "https://draftbox.invalid" && parsed.pathname === "/oauth/authorize" ? `${parsed.pathname}${parsed.search}` : "/";
+  } catch { return "/"; }
+}
+
+function consentPage(csrf, parameters) {
+  const hidden = Object.entries(parameters).map(([key, value]) =>
+    `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`).join("");
+  const scopes = parameters.scope.split(" ").map((scope) => scope === "draftbox:upload"
+    ? "Отправлять выбранный финальный мем в Inbox подключённого TikTok-аккаунта"
+    : "Проверять статус уже созданного Inbox-черновика").map((label) => `<li>${escapeHtml(label)}</li>`).join("");
+  return `<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Подключить ChatGPT к DraftBox</title><body style="font:16px system-ui;max-width:38rem;margin:10vh auto;padding:0 1rem;background:#101114;color:#f4f4f5">
+<h1>Подключить ChatGPT к DraftBox?</h1><p>Доступ будет только к текущему DraftBox и уже подключённому TikTok-аккаунту. Прямая публикация в профиль недоступна.</p>
+<ul>${scopes}</ul><form method="post" action="/oauth/authorize/">${hidden}<input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}">
+<button name="decision" value="approve" type="submit">Разрешить</button> <button name="decision" value="deny" type="submit">Отказать</button></form></body></html>`;
+}
+
+async function registeredOAuthClient(env, clientId) {
+  if (typeof clientId !== "string" || !/^[A-Za-z0-9_-]{40,64}$/u.test(clientId)) return null;
+  const result = await oauthGuardRequest(env, "oauth_get_client", clientId);
+  return result.client || null;
+}
+
+function requestedOAuthScopes(value) {
+  const scopes = String(value || "").trim().split(/\s+/u).filter(Boolean);
+  if (!scopes.length || scopes.some((scope) => !OAUTH_SCOPES.includes(scope)) || new Set(scopes).size !== scopes.length) return null;
+  return scopes;
+}
+
+async function readOAuthAuthorizationRequest(url, env, origin) {
+  const p = url.searchParams;
+  const clientId = p.get("client_id") || "";
+  const redirectUri = p.get("redirect_uri") || "";
+  const client = await registeredOAuthClient(env, clientId);
+  if (!client || !client.redirect_uris.includes(redirectUri) || !allowedOAuthRedirect(redirectUri)) return null;
+  const scopeList = requestedOAuthScopes(p.get("scope"));
+  const state = p.get("state") || "";
+  const challenge = p.get("code_challenge") || "";
+  const resource = p.get("resource") || origin;
+  if (p.get("response_type") !== "code" || !scopeList || state.length < 16 || state.length > 512
+      || !/^[A-Za-z0-9_-]{43,128}$/u.test(challenge) || p.get("code_challenge_method") !== "S256"
+      || resource !== origin) return null;
+  return { clientId, redirectUri, scope: scopeList.join(" "), state, challenge, resource };
+}
+
+function oauthRedirectError(redirectUri, state, origin, error) {
+  const target = new URL(redirectUri);
+  target.searchParams.set("error", error);
+  if (state) target.searchParams.set("state", state);
+  target.searchParams.set("iss", origin);
+  return redirectResponse(target.toString());
+}
+
+async function handleOAuthRegister(request, env) {
+  if (request.method !== "POST" || (request.headers.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+    return oauthJson({ error: "invalid_request" }, 400);
+  }
+  let body;
+  try { body = JSON.parse(new TextDecoder().decode(await readLimitedBody(request, 16 * 1024))); }
+  catch { return oauthJson({ error: "invalid_client_metadata" }, 400); }
+  const redirects = body?.redirect_uris;
+  if (!Array.isArray(redirects) || redirects.length < 1 || redirects.length > 10
+      || redirects.some((uri) => typeof uri !== "string" || !allowedOAuthRedirect(uri))
+      || new Set(redirects).size !== redirects.length
+      || (body.token_endpoint_auth_method && body.token_endpoint_auth_method !== "none")
+      || (body.grant_types && (!Array.isArray(body.grant_types) || body.grant_types.some((v) => !["authorization_code", "refresh_token"].includes(v))))
+      || (body.response_types && (!Array.isArray(body.response_types) || body.response_types.some((v) => v !== "code")))
+      || (body.scope && requestedOAuthScopes(body.scope) === null)) {
+    return oauthJson({ error: "invalid_client_metadata" }, 400);
+  }
+  const clientId = randomToken(32);
+  const record = {
+    client_id: clientId,
+    client_name: String(body.client_name || "ChatGPT").slice(0, 100),
+    redirect_uris: redirects,
+    created_at: Date.now(),
+    expires_at: Date.now() + 365 * 24 * 60 * 60 * 1000,
+  };
+  try { await oauthGuardRequest(env, "oauth_register_client", clientId, record); }
+  catch { return oauthJson({ error: "server_error" }, 503); }
+  return oauthJson({
+    client_id: clientId,
+    client_name: record.client_name,
+    redirect_uris: redirects,
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    scope: OAUTH_SCOPES.join(" "),
+  }, 201);
+}
+
+async function handleOAuthAuthorize(request, env, url) {
+  const { origin } = originAndCallback(env, request.url);
+  const session = await readSession(request, env);
+  let parameters;
+  let form = null;
+  if (request.method === "GET") {
+    parameters = await readOAuthAuthorizationRequest(url, env, origin);
+  } else if (request.method === "POST") {
+    const length = Number(request.headers.get("Content-Length") || 0);
+    if (length > 16 * 1024) return new Response("Request too large", { status: 413 });
+    form = await request.formData();
+    const query = new URLSearchParams();
+    for (const key of ["client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge", "code_challenge_method", "resource"]) {
+      const value = form.get(key);
+      if (typeof value === "string") query.set(key, value);
+    }
+    parameters = await readOAuthAuthorizationRequest(new URL(`/oauth/authorize/?${query}`, url.origin), env, origin);
+  }
+  if (!parameters) return htmlResponse(loginPage(session.csrf, "Запрос OAuth некорректен или устарел."), 400, await makeSessionCookie(session, env));
+  if (!session.loggedIn) {
+    const query = new URLSearchParams({
+      client_id: parameters.clientId, redirect_uri: parameters.redirectUri, response_type: "code",
+      scope: parameters.scope, state: parameters.state, code_challenge: parameters.challenge,
+      code_challenge_method: "S256", resource: parameters.resource,
+    });
+    const returnTo = `/oauth/authorize?${query}`;
+    return redirectResponse(`/login/?return_to=${encodeURIComponent(returnTo)}`, await makeSessionCookie(session, env));
+  }
+  if (request.method === "GET") return htmlResponse(consentPage(session.csrf, parameters), 200, await makeSessionCookie(session, env));
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
+  await requireCsrf(session, form);
+  const decision = form.get("decision");
+  if (decision !== "approve") return oauthRedirectError(parameters.redirectUri, parameters.state, origin, "access_denied");
+  const code = randomToken(32);
+  const codeHash = await tokenHash(code);
+  const codeRecord = { ...parameters, state: undefined, expires_at: Date.now() + OAUTH_CODE_TTL_MS };
+  try { await oauthGuardRequest(env, "oauth_store_code", codeHash, codeRecord); }
+  catch { return htmlResponse(consentPage(session.csrf, parameters), 503); }
+  const target = new URL(parameters.redirectUri);
+  target.searchParams.set("code", code);
+  target.searchParams.set("state", parameters.state);
+  target.searchParams.set("iss", origin);
+  return redirectResponse(target.toString(), await makeSessionCookie(session, env));
+}
+
+async function handleOAuthToken(request, env) {
+  if (request.method !== "POST" || (request.headers.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase() !== "application/x-www-form-urlencoded") {
+    return oauthJson({ error: "invalid_request" }, 400);
+  }
+  let form;
+  try { form = new URLSearchParams(new TextDecoder().decode(await readLimitedBody(request, 16 * 1024))); }
+  catch { return oauthJson({ error: "invalid_request" }, 400); }
+  const { origin } = originAndCallback(env, request.url);
+  if ((form.get("resource") || origin) !== origin || form.get("client_secret") || form.get("client_assertion")) {
+    return oauthJson({ error: "invalid_request" }, 400);
+  }
+  const clientId = form.get("client_id") || "";
+  const client = await registeredOAuthClient(env, clientId);
+  if (!client) return oauthJson({ error: "invalid_client" }, 401);
+  if (form.get("grant_type") === "authorization_code") {
+    const code = form.get("code") || "";
+    const redirectUri = form.get("redirect_uri") || "";
+    const verifier = form.get("code_verifier") || "";
+    if (!/^[A-Za-z0-9._~-]{43,128}$/u.test(verifier) || !client.redirect_uris.includes(redirectUri)) return oauthJson({ error: "invalid_grant" }, 400);
+    const challenge = b64url(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(verifier))));
+    const accessToken = randomToken(32);
+    const refreshToken = randomToken(48);
+    const now = Date.now();
+    const record = {
+      client_id: clientId,
+      resource: origin,
+      scope: "",
+      access_expires_at: now + OAUTH_ACCESS_TTL_MS,
+      refresh_expires_at: now + OAUTH_REFRESH_TTL_MS,
+      access_hash: await tokenHash(accessToken),
+      refresh_hash: await tokenHash(refreshToken),
+    };
+    let result;
+    try {
+      result = await oauthGuardRequest(env, "oauth_consume_code_issue_tokens", await tokenHash(code), {
+        client_id: clientId, redirect_uri: redirectUri, challenge, resource: origin, record,
+      });
+    } catch { return oauthJson({ error: "server_error" }, 503); }
+    if (!result.ok) return oauthJson({ error: "invalid_grant" }, 400);
+    record.scope = result.scope;
+    return oauthJson({ access_token: accessToken, token_type: "Bearer", expires_in: Math.floor(OAUTH_ACCESS_TTL_MS / 1000), refresh_token: refreshToken, scope: result.scope });
+  }
+  if (form.get("grant_type") === "refresh_token") {
+    const oldRefresh = form.get("refresh_token") || "";
+    const accessToken = randomToken(32);
+    const refreshToken = randomToken(48);
+    const now = Date.now();
+    const record = {
+      client_id: clientId,
+      resource: origin,
+      access_expires_at: now + OAUTH_ACCESS_TTL_MS,
+      refresh_expires_at: now + OAUTH_REFRESH_TTL_MS,
+      access_hash: await tokenHash(accessToken),
+      refresh_hash: await tokenHash(refreshToken),
+    };
+    let result;
+    try { result = await oauthGuardRequest(env, "oauth_rotate_refresh_token", await tokenHash(oldRefresh), { client_id: clientId, record }); }
+    catch { return oauthJson({ error: "server_error" }, 503); }
+    if (!result.ok) return oauthJson({ error: "invalid_grant" }, 400);
+    return oauthJson({ access_token: accessToken, token_type: "Bearer", expires_in: Math.floor(OAUTH_ACCESS_TTL_MS / 1000), refresh_token: refreshToken, scope: result.scope });
+  }
+  return oauthJson({ error: "unsupported_grant_type" }, 400);
+}
+
+async function validateOAuthAccess(env, token, origin) {
+  if (!token || token.length > 256) return null;
+  const result = await oauthGuardRequest(env, "oauth_get_access", await tokenHash(token));
+  const record = result.access;
+  if (!record || record.access_expires_at <= Date.now() || record.resource !== origin) return null;
+  return record;
+}
+
 async function readLimitedBody(request, maxBytes) {
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
@@ -658,6 +939,7 @@ function mcpTools() {
     {
       name: "upload_finished_meme_to_inbox",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      securitySchemes: [{ type: "oauth2", scopes: ["draftbox:upload"] }],
       description: "Upload one final, selected 1080×1920 JPEG to the already connected TikTok account's Inbox using DraftBox. This only initiates TikTok MEDIA_UPLOAD with video.upload; it never directly publishes. Do not use for options or previews. The same exact JPEG is protected against duplicate uploads for 24 hours.",
       inputSchema: {
         type: "object",
@@ -671,6 +953,7 @@ function mcpTools() {
     {
       name: "check_finished_meme_inbox_status",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      securitySchemes: [{ type: "oauth2", scopes: ["draftbox:status"] }],
       description: "Check an existing DraftBox upload by its returned image_sha256. Reports TikTok accepted, Inbox notification sent, published, failed, or unknown. It never starts another upload.",
       inputSchema: {
         type: "object",
@@ -684,22 +967,19 @@ function mcpTools() {
   ];
 }
 
-async function handleMcpRequest(request, env) {
-  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST", "Cache-Control": "no-store" } });
-  if (!await isAgentAuthorized(request, env)) {
-    const status = typeof env.AGENT_UPLOAD_TOKEN === "string" && env.AGENT_UPLOAD_TOKEN.length >= 43 ? 401 : 503;
-    return jsonResponse({ error: status === 401 ? "Unauthorized" : "Agent upload is not configured." }, status, status === 401 ? { "WWW-Authenticate": "Bearer" } : {});
-  }
-  if (!(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) {
-    return jsonResponse({ error: "Content-Type must be application/json." }, 415);
-  }
-  let body;
-  try {
-    const bytes = await readLimitedBody(request, MCP_MAX_BODY_BYTES);
-    body = JSON.parse(new TextDecoder().decode(bytes));
-  } catch (error) {
-    return jsonResponse({ error: error instanceof DraftBoxError ? error.message : "Invalid MCP request." }, error instanceof DraftBoxError ? 413 : 400);
-  }
+function mcpRequiredScope(body) {
+  if (body?.method !== "tools/call") return "draftbox:upload";
+  if (body.params?.name === "check_finished_meme_inbox_status") return "draftbox:status";
+  return "draftbox:upload";
+}
+
+function mcpAuthError(requestUrl, scope, error = "") {
+  const origin = new URL(requestUrl).origin;
+  return jsonResponse({ error: error || "Unauthorized" }, error === "insufficient_scope" ? 403 : 401,
+    { "WWW-Authenticate": oauthChallenge(origin, scope, error), "Cache-Control": "no-store" });
+}
+
+async function processMcpBody(body, auth, request, env) {
   if (!body || body.jsonrpc !== "2.0" || typeof body.method !== "string") {
     return jsonResponse({ jsonrpc: "2.0", id: body?.id ?? null, error: { code: -32600, message: "Invalid Request" } }, 400);
   }
@@ -713,14 +993,18 @@ async function handleMcpRequest(request, env) {
       result: {
         protocolVersion: typeof requested === "string" ? requested : "2025-03-26",
         capabilities: { tools: { listChanged: false } },
-        instructions: "Only send the one saved, selected final meme. Never send variants or previews. This tool initiates TikTok Inbox upload with video.upload and never publishes. After upload, check status; if unknown, do not retry.",
-        serverInfo: { name: "DraftBox TikTok Inbox", version: "1.0.0" },
+        instructions: "Only send the one saved, selected final meme. Never send variants or previews. This tool uploads to the existing TikTok account's Inbox and never publishes. After upload, check status; if unknown, do not retry.",
+        serverInfo: { name: "DraftBox TikTok Inbox", version: "1.1.0" },
       },
     }, 200, { "MCP-Protocol-Version": typeof requested === "string" ? requested : "2025-03-26" });
   }
   if (body.method === "tools/list") return jsonResponse({ jsonrpc: "2.0", id: body.id ?? null, result: { tools: mcpTools() } });
   if (body.method !== "tools/call") {
     return jsonResponse({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32601, message: "Method not found" } }, 200);
+  }
+  const requiredScope = mcpRequiredScope(body);
+  if (auth?.type === "oauth" && !String(auth.record.scope || "").split(" ").includes(requiredScope)) {
+    return mcpAuthError(request.url, requiredScope, "insufficient_scope");
   }
   const name = body.params?.name;
   const args = body.params?.arguments || {};
@@ -738,6 +1022,45 @@ async function handleMcpRequest(request, env) {
   return jsonResponse({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32602, message: "Unknown tool or invalid arguments" } }, 200);
 }
 
+async function handleMcpRequest(request, env) {
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST", "Cache-Control": "no-store" } });
+  if (!(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) {
+    return jsonResponse({ error: "Content-Type must be application/json." }, 415);
+  }
+  const authorization = request.headers.get("Authorization") || "";
+  let auth = null;
+  let hasAuthorization = false;
+  if (authorization) {
+    const tokenMatch = authorization.match(/^Bearer ([A-Za-z0-9._~-]+)$/u);
+    if (!tokenMatch) return mcpAuthError(request.url, "draftbox:upload", "invalid_token");
+    if (await isAgentAuthorized(request, env)) {
+      auth = { type: "static", record: { scope: OAUTH_SCOPES.join(" ") } };
+    } else {
+      try {
+        const record = await validateOAuthAccess(env, tokenMatch[1], new URL(request.url).origin);
+        if (!record) return mcpAuthError(request.url, "draftbox:upload", "invalid_token");
+        auth = { type: "oauth", record };
+      } catch { return mcpAuthError(request.url, "draftbox:upload", "invalid_token"); }
+    }
+    hasAuthorization = true;
+  }
+  let body;
+  try {
+    const declaredLength = Number(request.headers.get("Content-Length") || 0);
+    if (!hasAuthorization && declaredLength > MCP_PUBLIC_BODY_BYTES) return mcpAuthError(request.url, "draftbox:upload");
+    const bytes = await readLimitedBody(request, hasAuthorization ? MCP_MAX_BODY_BYTES : MCP_PUBLIC_BODY_BYTES);
+    body = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (error) {
+    if (!hasAuthorization && error instanceof DraftBoxError) return mcpAuthError(request.url, "draftbox:upload");
+    return jsonResponse({ error: error instanceof DraftBoxError ? error.message : "Invalid MCP request." }, error instanceof DraftBoxError ? 413 : 400);
+  }
+  if (!hasAuthorization && body.method === "tools/call") return mcpAuthError(request.url, mcpRequiredScope(body));
+  if (!hasAuthorization && !["initialize", "tools/list", "ping", "notifications/initialized"].includes(body.method)) {
+    return mcpAuthError(request.url, "draftbox:upload");
+  }
+  return processMcpBody(body, auth, request, env);
+}
+
 export class AgentUploadGuard {
   constructor(state) {
     this.state = state;
@@ -747,6 +1070,68 @@ export class AgentUploadGuard {
     let input;
     try { input = await request.json(); } catch { return jsonResponse({ error: "Invalid request" }, 400); }
     const { operation, key, record } = input || {};
+    if (typeof operation === "string" && operation.startsWith("oauth_")) {
+      const oauthKey = String(key || "");
+      const validKey = /^[a-f0-9]{64}$/u.test(oauthKey) || /^[A-Za-z0-9_-]{40,64}$/u.test(oauthKey);
+      if (!validKey) return jsonResponse({ error: "Invalid OAuth key" }, 400);
+      return this.state.blockConcurrencyWhile(async () => {
+        const storage = this.state.storage;
+        const now = Date.now();
+        if (operation === "oauth_register_client") {
+          const rate = await storage.get("oauth_register_rate_window");
+          if (rate && now < rate.reset_at && rate.count >= 20) return jsonResponse({ error: "rate_limited" }, 429);
+          if (!rate || now >= rate.reset_at) await storage.put("oauth_register_rate_window", { count: 1, reset_at: now + 60 * 60 * 1000 });
+          else await storage.put("oauth_register_rate_window", { count: rate.count + 1, reset_at: rate.reset_at });
+          const storageKey = `oauth:client:${oauthKey}`;
+          if (await storage.get(storageKey)) return jsonResponse({ error: "client_exists" }, 409);
+          await storage.put(storageKey, record);
+          return jsonResponse({ ok: true });
+        }
+        if (operation === "oauth_get_client") {
+          const client = await storage.get(`oauth:client:${oauthKey}`);
+          return jsonResponse({ client: client && client.expires_at > now ? client : null });
+        }
+        if (operation === "oauth_store_code") {
+          await storage.put(`oauth:code:${oauthKey}`, record);
+          return jsonResponse({ ok: true });
+        }
+        if (operation === "oauth_consume_code_issue_tokens") {
+          const codeKey = `oauth:code:${oauthKey}`;
+          const code = await storage.get(codeKey);
+          const expected = record || {};
+          if (!code || code.expires_at <= now || code.clientId !== expected.client_id
+              || code.redirectUri !== expected.redirect_uri || code.challenge !== expected.challenge
+              || code.resource !== expected.resource) return jsonResponse({ ok: false });
+          await storage.delete(codeKey);
+          const tokens = { ...expected.record, scope: code.scope };
+          await storage.put(`oauth:access:${tokens.access_hash}`, tokens);
+          await storage.put(`oauth:refresh:${tokens.refresh_hash}`, {
+            client_id: tokens.client_id, resource: tokens.resource, scope: code.scope,
+            refresh_expires_at: tokens.refresh_expires_at, refresh_hash: tokens.refresh_hash,
+          });
+          return jsonResponse({ ok: true, scope: code.scope });
+        }
+        if (operation === "oauth_rotate_refresh_token") {
+          const refreshKey = `oauth:refresh:${oauthKey}`;
+          const existing = await storage.get(refreshKey);
+          if (!existing || existing.refresh_expires_at <= now || existing.client_id !== record?.client_id
+              || existing.resource !== record?.record?.resource) return jsonResponse({ ok: false });
+          await storage.delete(refreshKey);
+          const tokens = { ...record.record, scope: existing.scope };
+          await storage.put(`oauth:access:${tokens.access_hash}`, tokens);
+          await storage.put(`oauth:refresh:${tokens.refresh_hash}`, {
+            client_id: tokens.client_id, resource: tokens.resource, scope: existing.scope,
+            refresh_expires_at: tokens.refresh_expires_at, refresh_hash: tokens.refresh_hash,
+          });
+          return jsonResponse({ ok: true, scope: existing.scope });
+        }
+        if (operation === "oauth_get_access") {
+          const access = await storage.get(`oauth:access:${oauthKey}`);
+          return jsonResponse({ access: access && access.access_expires_at > now ? access : null });
+        }
+        return jsonResponse({ error: "Unsupported OAuth operation" }, 400);
+      });
+    }
     if (!/^[a-f0-9]{64}$/u.test(String(key || ""))) return jsonResponse({ error: "Invalid key" }, 400);
     return this.state.blockConcurrencyWhile(async () => {
       const storage = this.state.storage;
@@ -817,6 +1202,17 @@ async function handleAgentRequest(request, env, url) {
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   if (url.pathname === "/healthz" && request.method === "GET") return new Response("ok", { headers: { "Cache-Control": "no-store" } });
+  if (url.pathname === "/.well-known/oauth-protected-resource" && request.method === "GET") {
+    const { origin } = originAndCallback(env, request.url);
+    return oauthJson(oauthResourceMetadata(origin));
+  }
+  if (url.pathname === "/.well-known/oauth-authorization-server" && request.method === "GET") {
+    const { origin } = originAndCallback(env, request.url);
+    return oauthJson(oauthAuthorizationMetadata(origin));
+  }
+  if (url.pathname === "/oauth/register") return handleOAuthRegister(request, env);
+  if (url.pathname === "/oauth/authorize/" || url.pathname === "/oauth/authorize") return handleOAuthAuthorize(request, env, url);
+  if (url.pathname === "/oauth/token") return handleOAuthToken(request, env);
   if (url.pathname === "/mcp") return handleMcpRequest(request, env);
   if (url.pathname === "/agent/upload/" || url.pathname.startsWith("/agent/status/")) return handleAgentRequest(request, env, url);
   if (url.pathname.startsWith("/tiktok/media/")) return request.method === "GET" ? mediaResponse(env, url.pathname) : new Response("Method not allowed", { status: 405 });
@@ -825,15 +1221,16 @@ async function handleRequest(request, env) {
 
   const session = await readSession(request, env);
   if (url.pathname === "/login/" && (request.method === "GET" || request.method === "POST")) {
-    if (request.method === "GET") return htmlResponse(loginPage(session.csrf), 200, await makeSessionCookie(session, env));
+    if (request.method === "GET") return htmlResponse(loginPage(session.csrf, "", localReturnTo(url.searchParams.get("return_to") || "/")), 200, await makeSessionCookie(session, env));
     const form = await request.formData();
     await requireCsrf(session, form);
+    const returnTo = localReturnTo(form.get("return_to") || "/");
     const password = form.get("password");
     if (!await passwordMatches(password, env.APP_PASSWORD)) {
-      return htmlResponse(loginPage(session.csrf, "Пароль не подошёл."), 401, await makeSessionCookie(session, env));
+      return htmlResponse(loginPage(session.csrf, "Пароль не подошёл.", returnTo), 401, await makeSessionCookie(session, env));
     }
     const loggedIn = { loggedIn: true, csrf: randomToken(), exp: Math.floor(Date.now() / 1000) + COOKIE_TTL_SECONDS };
-    return redirectResponse("/", await makeSessionCookie(loggedIn, env));
+    return redirectResponse(returnTo, await makeSessionCookie(loggedIn, env));
   }
 
   if (url.pathname === "/logout/" && request.method === "POST") {
