@@ -32,6 +32,7 @@ class MemoryDOStorage {
   values = new Map();
   async get(key) { return this.values.get(key) ?? null; }
   async put(key, value) { this.values.set(key, structuredClone(value)); }
+  async delete(key) { return this.values.delete(key); }
   async list({ prefix = "" } = {}) {
     return new Map([...this.values.entries()].filter(([key]) => key.startsWith(prefix)));
   }
@@ -370,12 +371,22 @@ test("concurrent identical agent uploads call TikTok init only once", async () =
 
 test("remote MCP exposes only guarded upload and status tools", async () => {
   const env = makeEnv();
-  const denied = await call(env, "/mcp", {
+  const listedStatic = await call(env, "/mcp", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
   });
+  assert.equal(listedStatic.status, 200);
+  const unauthTools = (await listedStatic.json()).result.tools;
+  assert.deepEqual(unauthTools.map((tool) => tool.name), ["upload_finished_meme_to_inbox", "check_finished_meme_inbox_status"]);
+  assert.deepEqual(unauthTools[0].securitySchemes, [{ type: "oauth2", scopes: ["draftbox:upload"] }]);
+  const denied = await call(env, "/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "upload_finished_meme_to_inbox", arguments: {} } }),
+  });
   assert.equal(denied.status, 401);
+  assert.match(denied.headers.get("WWW-Authenticate"), /oauth-protected-resource/u);
 
   const headers = { Authorization: "Bearer " + env.AGENT_UPLOAD_TOKEN, "Content-Type": "application/json" };
   const initialized = await call(env, "/mcp", {
@@ -386,12 +397,12 @@ test("remote MCP exposes only guarded upload and status tools", async () => {
   assert.equal(initialized.status, 200);
   assert.equal(initialized.headers.get("MCP-Protocol-Version"), "2025-03-26");
 
-  const listed = await call(env, "/mcp", {
+  const listedAuth = await call(env, "/mcp", {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
   });
-  const toolNames = (await listed.json()).result.tools.map((tool) => tool.name);
+  const toolNames = (await listedAuth.json()).result.tools.map((tool) => tool.name);
   assert.deepEqual(toolNames, ["upload_finished_meme_to_inbox", "check_finished_meme_inbox_status"]);
   assert.equal(toolNames.some((name) => name.includes("publish")), false);
 });
@@ -422,6 +433,168 @@ test("ambiguous TikTok timeout is not retried and stays marked unknown", async (
     assert.equal(repeatedResult.duplicate_suppressed, true);
     assert.equal(repeatedResult.state, "unknown");
     assert.equal(initCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("ChatGPT OAuth uses PKCE, scopes, the existing TikTok account, and only Inbox upload", async () => {
+  const env = makeEnv();
+  await storeConnectedTestAccount(env);
+
+  const resourceMetadata = await call(env, "/.well-known/oauth-protected-resource");
+  assert.equal(resourceMetadata.status, 200);
+  assert.equal((await resourceMetadata.json()).resource, APP_ORIGIN);
+  const authorizationMetadata = await call(env, "/.well-known/oauth-authorization-server");
+  const authorizationConfig = await authorizationMetadata.json();
+  assert.equal(authorizationConfig.issuer, APP_ORIGIN);
+  assert.equal(authorizationConfig.registration_endpoint, `${APP_ORIGIN}/oauth/register`);
+  assert.deepEqual(authorizationConfig.code_challenge_methods_supported, ["S256"]);
+
+  const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+  const registration = await call(env, "/oauth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: [redirectUri] }),
+  });
+  assert.equal(registration.status, 201);
+  const client = await registration.json();
+  assert.match(client.client_id, /^[A-Za-z0-9_-]{43}$/u);
+
+  const badRegistration = await call(env, "/oauth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ redirect_uris: ["https://attacker.example/callback"] }),
+  });
+  assert.equal(badRegistration.status, 400);
+
+  const verifier = "A".repeat(43);
+  const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))).toString("base64url");
+  const state = "state-for-draftbox-mcp-test-2026";
+  const authorization = new URLSearchParams({
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "draftbox:upload draftbox:status",
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    resource: APP_ORIGIN,
+  });
+
+  const start = await call(env, `/oauth/authorize/?${authorization}`);
+  assert.equal(start.status, 302);
+  const startCookie = cookieFrom(start);
+  const loginTarget = new URL(start.headers.get("Location"), APP_ORIGIN);
+  const loginPage = await call(env, `${loginTarget.pathname}${loginTarget.search}`, { headers: { Cookie: startCookie } });
+  const loginForm = new URLSearchParams({
+    csrf_token: csrfFrom(await loginPage.text()),
+    password: env.APP_PASSWORD,
+    return_to: loginTarget.searchParams.get("return_to"),
+  });
+  const loggedIn = await call(env, "/login/", {
+    method: "POST",
+    headers: { Cookie: startCookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: loginForm,
+  });
+  assert.equal(loggedIn.status, 302);
+  assert.equal(loggedIn.headers.get("Location"), loginTarget.searchParams.get("return_to"));
+
+  const consentUrl = new URL(loggedIn.headers.get("Location"), APP_ORIGIN);
+  const consent = await call(env, `${consentUrl.pathname}${consentUrl.search}`, { headers: { Cookie: cookieFrom(loggedIn) } });
+  assert.equal(consent.status, 200);
+  const consentHtml = await consent.text();
+  assert.match(consentHtml, /только к текущему DraftBox и уже подключённому TikTok-аккаунту/u);
+  const consentForm = new URLSearchParams(authorization);
+  consentForm.set("csrf_token", csrfFrom(consentHtml));
+  consentForm.set("decision", "approve");
+  const approved = await call(env, "/oauth/authorize/", {
+    method: "POST",
+    headers: { Cookie: cookieFrom(consent), "Content-Type": "application/x-www-form-urlencoded" },
+    body: consentForm,
+  });
+  assert.equal(approved.status, 302);
+  const callback = new URL(approved.headers.get("Location"));
+  assert.equal(callback.origin + callback.pathname, redirectUri);
+  assert.equal(callback.searchParams.get("state"), state);
+  assert.equal(callback.searchParams.get("iss"), APP_ORIGIN);
+
+  const tokenResponse = await call(env, "/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: client.client_id,
+      code: callback.searchParams.get("code"),
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+      resource: APP_ORIGIN,
+    }),
+  });
+  assert.equal(tokenResponse.status, 200);
+  const tokenSet = await tokenResponse.json();
+  assert.equal(tokenSet.scope, "draftbox:upload draftbox:status");
+
+  const originalFetch = globalThis.fetch;
+  const tiktokCalls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    tiktokCalls.push({ url: String(url), options });
+    if (String(url) === "https://open.tiktokapis.com/v2/post/publish/content/init/") {
+      return Response.json({ data: { publish_id: "p_pub_url~oauth-mcp-test" }, error: { code: "ok" } });
+    }
+    if (String(url) === "https://open.tiktokapis.com/v2/post/publish/status/fetch/") {
+      return Response.json({ data: { status: "SEND_TO_USER_INBOX" }, error: { code: "ok" } });
+    }
+    throw new Error(`Unexpected outbound request: ${String(url)}`);
+  };
+
+  try {
+    const authHeaders = { Authorization: `Bearer ${tokenSet.access_token}`, "Content-Type": "application/json" };
+    const list = await call(env, "/mcp", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    const names = (await list.json()).result.tools.map((tool) => tool.name);
+    assert.deepEqual(names, ["upload_finished_meme_to_inbox", "check_finished_meme_inbox_status"]);
+
+    const image = Buffer.from(agentJpeg()).toString("base64");
+    const upload = await call(env, "/mcp", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name: "upload_finished_meme_to_inbox", arguments: { image_base64: image } },
+      }),
+    });
+    const uploadResult = (await upload.json()).result.structuredContent;
+    assert.equal(uploadResult.state, "accepted");
+    assert.equal(uploadResult.duplicate_suppressed, false);
+
+    const status = await call(env, "/mcp", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 3, method: "tools/call",
+        params: { name: "check_finished_meme_inbox_status", arguments: { image_sha256: uploadResult.image_sha256 } },
+      }),
+    });
+    assert.equal((await status.json()).result.structuredContent.state, "inbox");
+
+    const duplicate = await call(env, "/mcp", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 4, method: "tools/call",
+        params: { name: "upload_finished_meme_to_inbox", arguments: { image_base64: image } },
+      }),
+    });
+    assert.equal((await duplicate.json()).result.structuredContent.duplicate_suppressed, true);
+    assert.equal(tiktokCalls.filter((entry) => entry.url.endsWith("/content/init/")).length, 1);
+    assert.equal(tiktokCalls.filter((entry) => entry.url.endsWith("/status/fetch/")).length, 1);
+    assert.equal(tiktokCalls.some((entry) => entry.url.endsWith("/publish/")), false);
+    const linkedAccount = await env.TOKENS.get("tiktok_tokens", "json");
+    assert.equal(linkedAccount.open_id, "existing-connected-open-id");
   } finally {
     globalThis.fetch = originalFetch;
   }
