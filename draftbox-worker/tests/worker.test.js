@@ -595,6 +595,33 @@ test("ChatGPT OAuth uses PKCE, scopes, the existing TikTok account, and only Inb
     assert.equal(tiktokCalls.some((entry) => entry.url.endsWith("/publish/")), false);
     const linkedAccount = await env.TOKENS.get("tiktok_tokens", "json");
     assert.equal(linkedAccount.open_id, "existing-connected-open-id");
+
+    const rotated = await call(env, "/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: tokenSet.refresh_token,
+        resource: APP_ORIGIN,
+      }),
+    });
+    assert.equal(rotated.status, 200);
+    const rotatedSet = await rotated.json();
+    assert.equal(rotatedSet.scope, "draftbox:upload draftbox:status");
+    assert.notEqual(rotatedSet.refresh_token, tokenSet.refresh_token);
+    const replayed = await call(env, "/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: tokenSet.refresh_token,
+        resource: APP_ORIGIN,
+      }),
+    });
+    assert.equal(replayed.status, 400);
+    assert.equal((await replayed.json()).error, "invalid_grant");
   } finally {
     globalThis.fetch = originalFetch;
   }
